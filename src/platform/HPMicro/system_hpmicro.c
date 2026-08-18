@@ -35,7 +35,21 @@
 #include "hpm_wdg_drv.h"
 #include "scheduler/scheduler.h"
 #include "watchdog_hpmicro.h"
-
+#include "hpm_uart_drv.h"
+#include "hpm_pmp_drv.h"
+#include "hpm_sysctl_drv.h"
+#include "hpm_gpio_drv.h"
+#include "hpm_soc.h"
+#include "hpm_interrupt.h"
+#include "hpm_debug_console.h"
+#include "hpm_pcfg_drv.h"
+#include "io_hpmicro.h"
+#include "hpm_sdxc_soc_drv.h"
+#ifdef HPM6750
+#include "hpm_pllctl_drv.h"
+#else
+#include "hpm_pllctlv2_drv.h"
+#endif
 uint32_t SystemCoreClock;
 uint32_t cachedResetFlags;
 
@@ -191,13 +205,263 @@ void systemWatchdogIsr(void)
 }
 
 
+// Default configurations
+#ifndef CONFIG_HPM_CONSOLE_UART_BASE
+#define CONFIG_HPM_CONSOLE_UART_BASE       HPM_UART0
+#endif
+
+#ifndef CONFIG_HPM_CONSOLE_UART_IRQ
+#define CONFIG_HPM_CONSOLE_UART_IRQ        IRQn_UART0
+#endif
+
+#ifndef CONFIG_HPM_CONSOLE_UART_BAUDRATE
+#define CONFIG_HPM_CONSOLE_UART_BAUDRATE   (115200UL)
+#endif
+
+#ifndef CONFIG_HPM_CPU_FREQ
+#define CONFIG_HPM_CPU_FREQ              (816000000UL)
+#endif
+
+#ifndef CONFIG_HPM_LED_GPIO_CTRL
+#define CONFIG_HPM_LED_GPIO_CTRL         HPM_GPIO0
+#endif
+
+#ifndef CONFIG_HPM_LED_GPIO_INDEX
+#define CONFIG_HPM_LED_GPIO_INDEX         GPIO_DI_GPIOB
+#endif
+
+#ifndef CONFIG_HPM_LED_GPIO_PIN
+#define CONFIG_HPM_LED_GPIO_PIN           12
+#endif
+
+#ifndef CONFIG_HPM_LED_OFF_LEVEL
+#define CONFIG_HPM_LED_OFF_LEVEL          0
+#endif
+
+// Delay functions
+void board_delay_ms(uint32_t ms)
+{
+    clock_cpu_delay_ms(ms);
+}
+
+void board_delay_us(uint32_t us)
+{
+    clock_cpu_delay_us(us);
+}
+
+// UART initialization
+static void hpm_init_uart_pins(UART_Type *ptr)
+{
+    if (ptr == CONFIG_HPM_CONSOLE_UART_BASE) {
+        // Configure UART0 RX pin (PY06)
+        IOConfigGPIOAF(IOGetByTag(CONSOLE_UART_RX_PIN), IOCFG_AF_PP, CONSOLE_RX_AF);
+        // Configure UART0 TX pin (PY07)
+        IOConfigGPIOAF(IOGetByTag(CONSOLE_UART_TX_PIN), IOCFG_AF_PP, CONSOLE_TX_AF);
+    }
+    // Add other UART configurations as needed
+}
+
+// Console initialization
+static void hpm_init_console(void)
+{
+    console_config_t cfg;
+
+    hpm_init_uart_pins((UART_Type *) CONFIG_HPM_CONSOLE_UART_BASE);
+
+    clock_add_to_group(BOARD_CONSOLE_UART_CLK_NAME, 0);
+
+    cfg.type = CONSOLE_TYPE_UART;
+    cfg.base = (uint32_t) CONFIG_HPM_CONSOLE_UART_BASE;
+    cfg.src_freq_in_hz = clock_get_frequency(BOARD_CONSOLE_UART_CLK_NAME);
+    cfg.baudrate = CONFIG_HPM_CONSOLE_UART_BAUDRATE;
+
+    console_init(&cfg);
+}
+
+// PMP initialization
+static void hpm_init_pmp(void)
+{
+    uint32_t start_addr, end_addr, length;
+    pmp_entry_t pmp_entry[16];
+    uint8_t index = 0;
+
+    // Init non-cacheable memory
+    extern uint32_t __noncacheable_start__[];
+    extern uint32_t __noncacheable_end__[];
+    start_addr = (uint32_t) __noncacheable_start__;
+    end_addr = (uint32_t) __noncacheable_end__;
+    length = end_addr - start_addr;
+    if (length > 0) {
+        assert((length & (length - 1U)) == 0U);
+        assert((start_addr & (length - 1U)) == 0U);
+        pmp_entry[index].pmp_addr = PMP_NAPOT_ADDR(start_addr, length);
+        pmp_entry[index].pmp_cfg.val = PMP_CFG(READ_EN, WRITE_EN, EXECUTE_EN, ADDR_MATCH_NAPOT, REG_UNLOCK);
+        pmp_entry[index].pma_addr = PMA_NAPOT_ADDR(start_addr, length);
+        pmp_entry[index].pma_cfg.val = PMA_CFG(ADDR_MATCH_NAPOT, MEM_TYPE_MEM_NON_CACHE_BUF, AMO_EN);
+        index++;
+    }
+
+    pmp_config(&pmp_entry[0], index);
+}
+
+// Clock initialization
+static void hpm_init_clock(void)
+{
+#ifdef HPM6360
+
+    uint32_t cpu0_freq = clock_get_frequency(clock_cpu0);
+    if (cpu0_freq == PLLCTL_SOC_PLL_REFCLK_FREQ) {
+        /* Configure the External OSC ramp-up time: ~9ms */
+        pllctlv2_xtal_set_rampup_time(HPM_PLLCTLV2, 32UL * 1000UL * 9U);
+
+        /* Select clock setting preset1 */
+        sysctl_clock_set_preset(HPM_SYSCTL, 2);
+    }
+
+    /* Add clocks to group 0 */
+    clock_add_to_group(clock_cpu0, 0);
+    clock_add_to_group(clock_mchtmr0, 0);
+    clock_add_to_group(clock_ahbp, 0);
+    clock_add_to_group(clock_axic, 0);
+    clock_add_to_group(clock_axis, 0);
+    clock_add_to_group(clock_xpi0, 0);
+    clock_add_to_group(clock_xpi1, 0);
+    clock_add_to_group(clock_xdma, 0);
+    clock_add_to_group(clock_hdma, 0);
+    clock_add_to_group(clock_ram0, 0);
+    clock_add_to_group(clock_lmm0, 0);
+    clock_add_to_group(clock_gpio, 0);
+    clock_add_to_group(clock_mot0, 0);
+    clock_add_to_group(clock_mot1, 0);
+    clock_add_to_group(clock_synt, 0);
+    clock_add_to_group(clock_ptpc, 0);
+    /* Connect Group0 to CPU0 */
+    clock_connect_group_to_cpu(0, 0);
+
+    /* Bump up DCDC voltage to 1275mv */
+    pcfg_dcdc_set_voltage(HPM_PCFG, 1275);
+
+    /* Configure CPU to 648MHz, AXI/AHB to 162MHz */
+    sysctl_config_cpu0_domain_clock(HPM_SYSCTL, clock_source_pll1_clk0, 1, 4, 4);
+    /* Configure PLL1_CLK0 Post Divider to 1 */
+    pllctlv2_set_postdiv(HPM_PLLCTLV2, pllctlv2_pll1, pllctlv2_clk0, pllctlv2_div_1p0);    /* PLL1CLK0: 648MHz */
+    /* Configure PLL1_CLK1 Post Divider to 2 */
+    pllctlv2_set_postdiv(HPM_PLLCTLV2, pllctlv2_pll1, pllctlv2_clk1, pllctlv2_div_2p0);    /* PLL1CLK1: 324MHz */
+    /* Configure PLL1 clock frequency to 648MHz */
+    pllctlv2_init_pll_with_freq(HPM_PLLCTLV2, pllctlv2_pll1, BOARD_CPU_FREQ);
+    clock_update_core_clock();
+
+    /* Configure mchtmr to 24MHz */
+    clock_set_source_divider(clock_mchtmr0, clk_src_osc24m, 1);
+#endif
+#ifdef HPM6750
+
+    uint32_t cpu0_freq = clock_get_frequency(clock_cpu0);
+    if (cpu0_freq == PLLCTL_SOC_PLL_REFCLK_FREQ) {
+        /* Configure the External OSC ramp-up time: ~9ms */
+        pllctl_xtal_set_rampup_time(HPM_PLLCTL, 32UL * 1000UL * 9U);
+
+        /* Select clock setting preset1 */
+        sysctl_clock_set_preset(HPM_SYSCTL, sysctl_preset_1);
+    }
+
+    /* Add clocks to group 0 */
+    clock_add_to_group(clock_cpu0, 0);
+    clock_add_to_group(clock_mchtmr0, 0);
+    clock_add_to_group(clock_axi0, 0);
+    clock_add_to_group(clock_axi1, 0);
+    clock_add_to_group(clock_axi2, 0);
+    clock_add_to_group(clock_ahb, 0);
+    clock_add_to_group(clock_xdma, 0);
+    clock_add_to_group(clock_hdma, 0);
+    clock_add_to_group(clock_xpi0, 0);
+    clock_add_to_group(clock_xpi1, 0);
+    clock_add_to_group(clock_ram0, 0);
+    clock_add_to_group(clock_ram1, 0);
+    clock_add_to_group(clock_lmm0, 0);
+    clock_add_to_group(clock_lmm1, 0);
+    clock_add_to_group(clock_gpio, 0);
+    clock_add_to_group(clock_mot0, 0);
+    clock_add_to_group(clock_mot1, 0);
+    clock_add_to_group(clock_mot2, 0);
+    clock_add_to_group(clock_mot3, 0);
+    clock_add_to_group(clock_synt, 0);
+    clock_add_to_group(clock_ptpc, 0);
+    /* Connect Group0 to CPU0 */
+    clock_connect_group_to_cpu(0, 0);
+
+    /* Add clocks to Group1 */
+    clock_add_to_group(clock_cpu1, 1);
+    clock_add_to_group(clock_mchtmr1, 1);
+    /* Connect Group1 to CPU1 */
+    clock_connect_group_to_cpu(1, 1);
+
+    if (status_success != pllctl_init_int_pll_with_freq(HPM_PLLCTL, 0, BOARD_CPU_FREQ)) {
+        printf("Failed to set pll0_clk0 to %ldHz\n", BOARD_CPU_FREQ);
+        while (1) {
+        }
+    }
+
+    clock_set_source_divider(clock_cpu0, clk_src_pll0_clk0, 1);
+    clock_set_source_divider(clock_cpu1, clk_src_pll0_clk0, 1);
+    clock_update_core_clock();
+
+    clock_set_source_divider(clock_ahb, clk_src_pll1_clk1, 2); /*200m hz*/
+    clock_set_source_divider(clock_mchtmr0, clk_src_osc24m, 1);
+    clock_set_source_divider(clock_mchtmr1, clk_src_osc24m, 1);
+#endif
+}
+
+// USB initialization function
+void hpm_usb_init(USB_Type *ptr)
+{
+#ifdef HPM6360
+    (void) ptr;
+#endif
+#ifdef HPM6750
+    clock_name_t usb_clk = (ptr == HPM_USB0) ? clock_usb0 : clock_usb1;
+#endif
+#ifdef HPM6360
+    clock_name_t usb_clk = clock_usb0;
+#endif
+
+    // Enable USB clock
+    clock_add_to_group(usb_clk, 0);
+}
+
 void systemInit(void)
 {
-    SystemCoreClock = BOARD_CPU_FREQ;
+    SystemCoreClock = CONFIG_HPM_CPU_FREQ;
     // RESET_FLAG is W1C, so preserve the startup snapshot before any board or
     // application code can clear it.
     cachedResetFlags = ppor_reset_get_flags(HPM_PPOR);
-    board_init();
+
+    // Initialize system clocks
+    hpm_init_clock();
+
+    // Initialize debug console
+    hpm_init_console();
+
+    // Initialize PMP (Memory Protection)
+    hpm_init_pmp();
+
+    // Print system information
+    printf("==============================\n");
+    printf("cpu0:\t\t %luHz\n", clock_get_frequency(clock_cpu0));
+    printf("==============================\n");
+
+    // Print Betaflight banner
+    const uint8_t banner[] = {"\n\
+----------------------------------------------------------------------\n\
+ ____       _        _____ _ _       _     _      _   _ ____  __  __ _\n\
+| __ )  ___| |_ __ _|  ___| (_) __ _| |__ | |_   | | | |  _ \\|  \\/  (_) ___ _ __ ___\n\
+|  _ \\ / _ \\ __/ _` | |_  | | |/ _` | '_ \\| __|  | |_| | |_) | |\\/| | |/ __| '__/ _ \\\n\
+| |_) |  __/ || (_| |  _| | | | (_| | | | | |_   |  _  |  __/| |  | | | (__| | | (_) |\n\
+|____/ \\___|\\__\\__,_|_|   |_|_|\\__, |_| |_|\\__|  |_| |_|_|   |_|  |_|_|\\___|_|  \\___/\n\
+                               |___/\n\
+----------------------------------------------------------------------\n"};
+    printf("%s", banner);
+
     cycleCounterInit();
     systemWatchdogInit();
 }
@@ -356,7 +620,7 @@ uint32_t board_sd_configure_clock(SDXC_Type *ptr, uint32_t freq, bool need_inver
         sdxc_enable_sd_clock(ptr, true);
         actual_freq = clock_get_frequency(sdxc_clk) / sdxc_get_clock_divider(ptr);
     } while (false);
-#elif defined(HPM6750)
+#else if defined(HPM6750)
     uint32_t actual_freq = 0;
     do {
         clock_name_t sdxc_clk = (ptr == HPM_SDXC0) ? clock_sdxc0 : clock_sdxc1;
